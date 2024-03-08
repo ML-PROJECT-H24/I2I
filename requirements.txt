@@ -4,7 +4,6 @@ pandas
 matplotlib
 torch
 torchvision
-tinyimagenet
 diffusers
 accelerate
 transformers
