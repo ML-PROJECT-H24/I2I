@@ -16,7 +16,7 @@ class LatentImageDataset(Dataset):
 
         loaded = np.load(path)
 
-        mean = loaded['mean'].astype(np.float32)
-        logvar = loaded['logvar'].astype(np.float32)
+        mean = loaded['mean'].astype(np.float32)[0]
+        logvar = loaded['logvar'].astype(np.float32)[0]
 
         return mean, logvar
