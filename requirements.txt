@@ -7,3 +7,5 @@ torchvision
 diffusers
 accelerate
 transformers
+timm
+tensorboard
