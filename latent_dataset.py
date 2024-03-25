@@ -14,8 +14,13 @@ class LatentImageDataset(Dataset):
     def __getitem__(self, idx):
         path = self.local_images[idx]
 
-        loaded = np.load(path, allow_pickle=True)
-
+        try:
+            loaded = np.load(path, allow_pickle=True)
+        except Exception as e:
+            print(f'Error loading {path}: {e}')
+            print('Skipping...')
+            return self.__getitem__(np.random.randint(0, len(self.local_images))) # Get a random image
+        
         mean = loaded['mean'].astype(np.float32)[0]
         logvar = loaded['logvar'].astype(np.float32)[0]
 
