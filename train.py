@@ -5,15 +5,16 @@ import os
 import datetime
 import numpy as np
 from tqdm import tqdm
+import torch.nn as nn
 
 import latent_dataset
 from torchvision.utils import save_image
 import torch.nn.functional as F
 
 from diffusers.models import AutoencoderKL
-from diffusers import UNet2DModel
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler
 
+from mdtv2 import MDTv2
 
 #
 # Config
@@ -26,10 +27,14 @@ argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--batch-size', type=int, default=16)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--gen-only', action='store_true', default=False)
+argparser.add_argument('--logdir', type=str, default='logs')
 
 args = argparser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+logdir = os.path.join(args.logdir, datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+os.makedirs(logdir, exist_ok=True)
 
 #
 # Dataset
@@ -73,74 +78,59 @@ def decode(z) -> torch.Tensor:
     return x
 
 #
-# Model
+# Denoising Model
 #
 
-model = UNet2DModel(
-    sample_size=32,  # the target image resolution
-    in_channels=4, 
-    out_channels=4, 
-    layers_per_block=2,  # how many ResNet layers to use per UNet block
-    block_out_channels=(32, 32, 64, 64),  # the number of output channels for each UNet block
-    down_block_types=(
-        "DownBlock2D", 
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-    ),
-    up_block_types=(
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-    ),
-).to(device)
+model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False)
+model = model.to(device)
 
-mean, logvar = next(iter(dataloader))
-mean, logvar = mean.to(device), logvar.to(device)
-
-sampled = sample(mean, logvar)
-
-print("Input shape:", sampled.shape)
-print("Output shape:", model(sampled, timestep=0).sample.shape)
+if args.resume_path is not None:
+    print(f'Resuming from {args.resume_path}')
+    model.load_state_dict(torch.load(args.resume_path))
 
 #
-# DDPM
+# Diffusion
 #
 
-total_timesteps = 1000
-noise_scheduler = DDPMScheduler(num_train_timesteps=total_timesteps)
-
-#noise = torch.randn(sampled.shape, device=device)
-
-# timesteps = torch.tensor([600], device=device)
-
-# noisy_image = noise_scheduler.add_noise(sampled, noise, timesteps)
-
-# decoded = decode(noisy_image)
-
-# Display
-
-# name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
-# save_image(decoded, name, nrow=3, normalize=True, value_range=(-1, 1))
+scheduler = DDIMScheduler()
 
 #
 # Evaluation
 #
 
-def evaluate(epoch, pipeline):
-    # Sample some images from random noise (this is the backward diffusion process).
-    # The default pipeline output type is `List[PIL.Image]`
-    images = pipeline(
-        batch_size=args.batch_size,
-        generator=torch.manual_seed(args.seed),
-    ).images
+def unconditional_sample(model, scheduler, num_samples):
 
-    for _, image in enumerate(images):
-        decoded = decode(image)
+    print("Generating...")
+
+    model.eval()
+
+    with torch.no_grad():
+
+        x_t = torch.randn(num_samples, 4, 32, 32, device=device)
+
+        scheduler.set_timesteps(50)
+
+        for t in tqdm(scheduler.timesteps):
+            # predict the noise residual
+            with torch.no_grad():
+                t = torch.tensor([t], device=device)
+                noise_pred = model(x_t, t)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            x_t = scheduler.step(noise_pred, t, x_t).prev_sample
+
+        # Decode
+        
+        decoded = decode(x_t)
+
         # Save image
-        name = f"generated_{epoch}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
-        save_image(decoded, name, nrow=3, normalize=True, value_range=(-1, 1))
+
+        name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        path = os.path.join(logdir, name)
+        save_image(decoded, path, nrow=3, normalize=True, value_range=(-1, 1))
+
+    model.train()
+    
 
 #
 # Training
@@ -157,9 +147,7 @@ def train_loop(model, optimizer, dataloader):
 
     batch_size = args.batch_size
 
-    pbar = tqdm(dataloader)
-
-    for (mean, logvar) in pbar:
+    for (mean, logvar) in dataloader:
         
         # Sample image from latent space
 
@@ -169,15 +157,15 @@ def train_loop(model, optimizer, dataloader):
         # Sample random noise & timesteps
 
         noise = torch.randn(x_0.shape, device=device)
-        timesteps = torch.randint(0, total_timesteps, (x_0.shape[0],), device=device)
+        timesteps = torch.randint(0, 1000, (x_0.shape[0],), device=device)
 
         # Add noise
 
-        x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
+        x_t = scheduler.add_noise(x_0, noise, timesteps)
 
         # Forward pass: Predict the noise residuals
 
-        predicted_noise = model(x_t, timesteps, return_dict=False)[0]
+        predicted_noise = model(x_t, timesteps, enable_mask=True)
 
         # Calculate loss
 
@@ -195,21 +183,26 @@ def train_loop(model, optimizer, dataloader):
 
         # Update progress bar
 
-        logs = {"loss": loss.item(), "step": global_step}
-
-        pbar.set_postfix(logs)
+        print(f"Step {global_step}, Loss: {loss.detach().item()}")
 
         global_batch += 1
         global_step += batch_size
 
-        if global_batch % 1000 == 0:
+        if global_batch % 100 == 0:
+            print(f"Eval")
+
             # Save model
             torch.save(model.state_dict(), 'model.pth')
+            torch.save(model.state_dict(), os.path.join(logdir, 'model.pth'))
 
-            
+            # Evaluate
+            unconditional_sample(model, scheduler, 1)
 
 
-train_loop(model, optimizer, dataloader)
+if not args.gen_only:
+    train_loop(model, optimizer, dataloader)
+
+unconditional_sample(model, scheduler, 1)
 
 
         

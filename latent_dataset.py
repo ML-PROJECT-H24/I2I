@@ -14,7 +14,7 @@ class LatentImageDataset(Dataset):
     def __getitem__(self, idx):
         path = self.local_images[idx]
 
-        loaded = np.load(path)
+        loaded = np.load(path, allow_pickle=True)
 
         mean = loaded['mean'].astype(np.float32)[0]
         logvar = loaded['logvar'].astype(np.float32)[0]
