@@ -112,7 +112,7 @@ def gen_img(model, scheduler):
 
     with torch.no_grad():
 
-        x_t = torch.randn(1, 4, 32, 32, device=device)
+        x_t = torch.randn(9, 4, 32, 32, device=device)
 
         scheduler.set_timesteps(50)
 
