@@ -4,16 +4,17 @@ import PIL
 import os
 import datetime
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import torch.nn as nn
 
 import latent_dataset
 from torchvision.utils import save_image
 import torch.nn.functional as F
 
+from accelerate import Accelerator
 from adan import Adan
 from diffusers.models import AutoencoderKL
-from diffusers import DDIMScheduler
+from diffusers import DDIMScheduler, DDPMScheduler
 from diffusers.training_utils import compute_snr
 
 from mdtv2 import MDTv2
@@ -23,14 +24,14 @@ from mdtv2 import MDTv2
 #
 
 argparser = argparse.ArgumentParser()
-argparser.add_argument('--data_dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
+argparser.add_argument('--data-dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
 argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
 argparser.add_argument('--mask-ratio', type=float, default=0.3)
 argparser.add_argument('--batch-size', type=int, default=16)
 argparser.add_argument('--epochs', type=int, default=256)
-argparser.add_argument('--steps_per_epoch', type=int, default=10000)
+argparser.add_argument('--steps-per-epoch', type=int, default=10000)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--gen-only', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -89,8 +90,10 @@ def save_sample(x, path):
 #
 # Denoising Model
 #
-
+#model: MDTv2 = MDTv2(depth=6, hidden_size=96, patch_size=2, num_heads=4, learn_sigma=False, mask_ratio=args.mask_ratio)
 model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False, mask_ratio=args.mask_ratio)
+#model: MDTv2 = MDTv2(depth=12, hidden_size=768, patch_size=2, num_heads=12, learn_sigma=False, mask_ratio=args.mask_ratio)
+#model: MDTv2 = MDTv2(depth=24, hidden_size=1024, patch_size=2, num_heads=16, learn_sigma=False, mask_ratio=args.mask_ratio)
 model = model.to(device)
 
 if args.resume_path is not None:
@@ -137,9 +140,15 @@ def gen_img(model, scheduler):
 # Training
 #
 
+accelerator = Accelerator(
+    mixed_precision='fp16'
+)
+
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
-def train_loop(model, optimizer, dataloader):
+def train_loop(model, optimizer, dataloader, scheduler):
+    
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     batch_size = args.batch_size
 
@@ -202,20 +211,23 @@ def train_loop(model, optimizer, dataloader):
 
             # Backward pass
 
-            loss.backward()
+            #loss.backward()
+            accelerator.backward(loss)
 
             # Update weights
-
+            
             optimizer.step()
             optimizer.zero_grad()
 
             # Update progress bar
 
             total_loss += loss.detach().item()
-            normalized_loss = total_loss / (i + 1)
 
             pbar.update(batch_size)
-            pbar.set_postfix({"Loss": normalized_loss})
+        
+        
+        pbar.set_postfix({"Loss": total_loss / (i + 1)})
+        pbar.close()
         
         # Save model
         try:
@@ -233,7 +245,7 @@ def train_loop(model, optimizer, dataloader):
         except Exception as e:
             print(f"Error generating sample: {e}")
 
-train_loop(model, optimizer, dataloader)
+train_loop(model, optimizer, dataloader, scheduler)
 
 
         
