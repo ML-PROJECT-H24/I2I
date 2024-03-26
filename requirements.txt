@@ -4,8 +4,10 @@ pandas
 matplotlib
 torch
 torchvision
+torcheval
 diffusers
 accelerate
 transformers
 timm
 tensorboard
+git+https://github.com/sail-sg/Adan.git

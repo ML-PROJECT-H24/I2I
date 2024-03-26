@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from diffusers.models import AutoencoderKL
 from diffusers import DDIMScheduler
+from adan import Adan
 
 from mdtv2 import MDTv2
 
@@ -24,7 +25,11 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument('--data_dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
 argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
+argparser.add_argument('--weight-decay', type=float, default=0)
+argparser.add_argument('--mask-ratio', type=float, default=0.3)
 argparser.add_argument('--batch-size', type=int, default=16)
+argparser.add_argument('--epochs', type=int, default=256)
+argparser.add_argument('--steps_per_epoch', type=int, default=10000)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--gen-only', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -77,11 +82,14 @@ def decode(z) -> torch.Tensor:
     # x = ((x + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
     return x
 
+def save_sample(x, path):
+    save_image(x, path, nrow=3, normalize=True, value_range=(-1, 1))
+
 #
 # Denoising Model
 #
 
-model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False)
+model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False, mask_ratio=args.mask_ratio)
 model = model.to(device)
 
 if args.resume_path is not None:
@@ -95,26 +103,23 @@ if args.resume_path is not None:
 scheduler = DDIMScheduler()
 
 #
-# Evaluation
+# Sampling
 #
 
-def unconditional_sample(model, scheduler, num_samples):
-
-    print("Generating...")
-
+def gen_img(model, scheduler):
     model.eval()
 
     with torch.no_grad():
 
-        x_t = torch.randn(num_samples, 4, 32, 32, device=device)
+        x_t = torch.randn(1, 4, 32, 32, device=device)
 
         scheduler.set_timesteps(50)
 
-        for t in tqdm(scheduler.timesteps):
+        for t in tqdm(scheduler.timesteps, desc="Sampling"):
             # predict the noise residual
             with torch.no_grad():
-                t = torch.tensor([t], device=device)
-                noise_pred = model(x_t, t)
+                tt = torch.tensor([t], device=device)
+                noise_pred = model(x_t, tt)
 
             # compute the previous noisy sample x_t -> x_t-1
             x_t = scheduler.step(noise_pred, t, x_t).prev_sample
@@ -123,86 +128,94 @@ def unconditional_sample(model, scheduler, num_samples):
         
         decoded = decode(x_t)
 
-        # Save image
-
-        name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
-        path = os.path.join(logdir, name)
-        save_image(decoded, path, nrow=3, normalize=True, value_range=(-1, 1))
-
     model.train()
-    
+
+    return decoded    
 
 #
 # Training
 #
 
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
 def train_loop(model, optimizer, dataloader):
 
-    global_batch = 0
-    global_step = 0
-
-    # Training loop
-
     batch_size = args.batch_size
 
-    for (mean, logvar) in dataloader:
+    steps_per_epoch = args.steps_per_epoch
+    batches_per_epoch = steps_per_epoch // batch_size
+    epochs = args.epochs
+
+    print(f"Steps per epoch: {steps_per_epoch}, Epochs: {epochs}")
+
+    for i in range(epochs):
+        # Run for batches_per_epoch batches
+
+        pbar = tqdm(desc=f"Epoch {i}", total=steps_per_epoch)
+
+        total_loss = 0
+
+        for i in range(batches_per_epoch):
+            # Get batch
+    
+            mean, logvar = next(iter(dataloader))
+            mean, logvar = mean.to(device), logvar.to(device)
+
+            # Sample image from latent space
+
+            x_0 = sample(mean, logvar)
+
+            # Sample random noise & timesteps
+
+            noise = torch.randn(x_0.shape, device=device)
+            timesteps = torch.randint(0, 1000, (x_0.shape[0],), device=device)
+
+            # Add noise
+
+            x_t = scheduler.add_noise(x_0, noise, timesteps)
+
+            # Forward pass: Predict the noise residuals
+
+            predicted_noise = model(x_t, timesteps, enable_mask=True)
+
+            # Calculate loss
+
+            loss = F.mse_loss(predicted_noise, noise)
+
+            # Backward pass
+
+            loss.backward()
+
+            # Update weights
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Update progress bar
+
+            total_loss += loss.detach().item()
+            normalized_loss = total_loss / (i + 1)
+
+            pbar.update(batch_size)
+            pbar.set_postfix({"Loss": normalized_loss})
         
-        # Sample image from latent space
-
-        mean, logvar = mean.to(device), logvar.to(device)
-        x_0 = sample(mean, logvar)
-
-        # Sample random noise & timesteps
-
-        noise = torch.randn(x_0.shape, device=device)
-        timesteps = torch.randint(0, 1000, (x_0.shape[0],), device=device)
-
-        # Add noise
-
-        x_t = scheduler.add_noise(x_0, noise, timesteps)
-
-        # Forward pass: Predict the noise residuals
-
-        predicted_noise = model(x_t, timesteps, enable_mask=True)
-
-        # Calculate loss
-
-        loss = F.mse_loss(predicted_noise, noise)
-
-        # Backward pass
-
-        loss.backward()
-
-        # Update weights
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # Update progress bar
-
-        print(f"Step {global_step}, Loss: {loss.detach().item()}")
-
-        global_batch += 1
-        global_step += batch_size
-
-        if global_batch % 100 == 0:
-            print(f"Eval")
-
-            # Save model
+        # Save model
+        try:
             torch.save(model.state_dict(), 'model.pth')
-            torch.save(model.state_dict(), os.path.join(logdir, 'model.pth'))
+        except Exception as e:
+            print(f"Error saving model: {e}")
 
+        try:
             # Evaluate
-            unconditional_sample(model, scheduler, 1)
+            gen = gen_img(model, scheduler)
 
+            name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+            path = os.path.join(logdir, name)
+            save_sample(gen, path)
+        except Exception as e:
+            print(f"Error generating sample: {e}")
 
-if not args.gen_only:
-    train_loop(model, optimizer, dataloader)
-
-unconditional_sample(model, scheduler, 1)
+train_loop(model, optimizer, dataloader)
 
 
         
