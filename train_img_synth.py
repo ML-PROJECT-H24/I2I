@@ -11,9 +11,10 @@ import latent_dataset
 from torchvision.utils import save_image
 import torch.nn.functional as F
 
+from adan import Adan
 from diffusers.models import AutoencoderKL
 from diffusers import DDIMScheduler
-from adan import Adan
+from diffusers.training_utils import compute_snr
 
 from mdtv2 import MDTv2
 
@@ -178,9 +179,26 @@ def train_loop(model, optimizer, dataloader):
 
             predicted_noise = model(x_t, timesteps, enable_mask=True)
 
+            # Min-SNR: https://arxiv.org/pdf/2303.09556.pdf
+
+            snr = compute_snr(scheduler, timesteps)
+
+            base_weight = (torch.stack([snr, 5 * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr)
+
+            if scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective needs to be floored to an SNR weight of one.
+                mse_loss_weights = base_weight + 1
+            else:
+                # Epsilon and sample both use the same loss weights.
+                mse_loss_weights = base_weight
+
+            mse_loss_weights[snr == 0] = 1.0
+
             # Calculate loss
 
-            loss = F.mse_loss(predicted_noise, noise)
+            loss = F.mse_loss(predicted_noise, noise, reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
 
             # Backward pass
 
