@@ -145,41 +145,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-
-    def __init__(self, num_classes, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(
-            num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0]) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-
-        labels = torch.where(drop_ids.to(labels.device),
-                             self.num_classes, labels)
-        return labels
-
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
-
-
 #################################################################################
 #                                 Core MDT Model                                #
 #################################################################################
@@ -257,8 +222,6 @@ class MDTv2(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        class_dropout_prob=0.1,
-        num_classes=1000,
         learn_sigma=True,
         mask_ratio=None,
         decode_layer=4,
@@ -274,8 +237,6 @@ class MDTv2(nn.Module):
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(
-            num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use learnbale sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(
@@ -337,9 +298,6 @@ class MDTv2(nn.Module):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -436,20 +394,18 @@ class MDTv2(nn.Module):
 
         return x
 
-    def forward(self, x, t, y, enable_mask=False):
+    def forward(self, x, t, enable_mask=False):
         """
         Forward pass of MDT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
         enable_mask: Use mask latent modeling
         """
         x = self.x_embedder(
             x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        c = t
 
 
         input_skip = x
@@ -496,32 +452,6 @@ class MDTv2(nn.Module):
         x = self.final_layer(x, c)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
-
-
-    def forward_with_cfg(self, x, t, y, cfg_scale=None, diffusion_steps=1000, scale_pow=4.0):
-        """
-        Forward pass of MDT, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        if cfg_scale is not None:
-            half = x[: len(x) // 2]
-            combined = torch.cat([half, half], dim=0)
-            model_out = self.forward(combined, t, y)
-            eps, rest = model_out[:, :3], model_out[:, 3:]
-            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-
-            scale_step = (
-                1-torch.cos(((1-t/diffusion_steps)**scale_pow)*math.pi))*1/2 # power-cos scaling 
-            real_cfg_scale = (cfg_scale-1)*scale_step + 1
-            real_cfg_scale = real_cfg_scale[: len(x) // 2].view(-1, 1, 1, 1)
-
-            half_eps = uncond_eps + real_cfg_scale * (cond_eps - uncond_eps)
-            eps = torch.cat([half_eps, half_eps], dim=0)
-            return torch.cat([eps, rest], dim=1)
-        else:
-            model_out = self.forward(x, t, y)
-            eps, rest = model_out[:, :3], model_out[:, 3:]
-            return torch.cat([eps, rest], dim=1)
 
 
 #################################################################################

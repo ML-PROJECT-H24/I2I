@@ -13,7 +13,6 @@ from torch.utils.data import DataLoader
 
 from accelerate import Accelerator
 from adan import Adan
-import diffusers 
 from diffusers.models import AutoencoderKL
 from diffusers import DDIMScheduler
 from diffusers.training_utils import compute_snr
@@ -26,6 +25,7 @@ from mdtv2 import MDTv2
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--data-dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
+argparser.add_argument('--num-actual-classes', type=int, default=1000)
 argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
@@ -34,7 +34,7 @@ argparser.add_argument('--batch-size', type=int, default=32)
 argparser.add_argument('--epochs', type=int, default=512)
 argparser.add_argument('--steps-per-epoch', type=int, default=9984)
 argparser.add_argument('--resume-path', type=str, default=None)
-argparser.add_argument('--gen-only', action='store_true', default=False)
+argparser.add_argument('--no-eval', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
 
 args = argparser.parse_args()
@@ -48,37 +48,12 @@ os.makedirs(logdir, exist_ok=True)
 # Dataset
 #
 
-class BlockRandomSampler(torch.utils.data.Sampler):
-    def __init__(self, data_source, batch_size):
-        self.data_source = data_source
-        self.batch_size = batch_size
-        self.num_samples = len(data_source)
-        self.num_batches = self.num_samples // batch_size
-        self.total_size = self.num_batches * batch_size
-
-        self.generator = torch.Generator()
-        self.generator.manual_seed(args.seed)
-
-    def __iter__(self):
-        offset = torch.randint(0, self.batch_size, (1,)).item() # For better shuffling
-        batch_indices = torch.randperm(self.num_batches - 1, generator=self.generator).tolist()
-
-        for i in batch_indices:
-            batch_start_idx = i * self.batch_size + offset
-            yield from range(batch_start_idx, batch_start_idx + self.batch_size)
-
-    def __len__(self):
-        return self.total_size
-    
 dataset = latent_dataset.LatentImageDataset(args.data_dir)
-sampler = BlockRandomSampler(dataset, args.batch_size)
-dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, pin_memory=True)
+dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
 def dataloader_generator(dataloader):
     while True:
         yield from dataloader
-
-
 
 #
 # Autoencoder
@@ -111,7 +86,6 @@ def sample(mean: torch.FloatTensor, logvar: torch.FloatTensor) -> torch.FloatTen
 @torch.no_grad()
 def decode(z) -> torch.Tensor:
     x = vae.decode(z / scale_factor, return_dict=False)[0]
-    # x = ((x + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
     return x
 
 def save_sample(x, path):
@@ -121,7 +95,9 @@ def save_sample(x, path):
 # Denoising Model
 #
 
-model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False, mask_ratio=args.mask_ratio)
+num_classes = 1000
+model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
+#model: MDTv2 = MDTv2(depth=12, hidden_size=768, patch_size=2, num_heads=12, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
 model = model.to(device)
 
 if args.resume_path is not None:
@@ -139,36 +115,47 @@ noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
 # Sampling
 #
 
-def gen_samples(model, noise_scheduler, num_samples = 8):
+def gen_samples(model, noise_scheduler, num_samples = 8, cgf=False):
     model.eval()
 
     with torch.no_grad():
 
         x_t = torch.randn(num_samples, 4, 32, 32, device=device)
+        classes_rand = torch.randint(0, args.num_actual_classes, (num_samples,), device=device)
+
+        if cgf: # Classifier free guidance
+            classes_null = torch.tensor([num_classes] * num_samples, device=device)
+            classes_all = torch.cat([classes_rand, classes_null], 0)
+            x_t = torch.cat([x_t, x_t], 0)
+        else: # Random classes
+            classes_all = classes_rand
 
         noise_scheduler.set_timesteps(50)
 
         for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
             # predict the noise residual
             with torch.no_grad():
+                # Classifier free guidance
                 tt = torch.tensor([t], device=device)
-                noise_pred = model(x_t, tt)
+                noise_pred = model.forward_with_cfg(x_t, tt, classes_all)
 
             # compute the previous noisy sample x_t -> x_t-1
             x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
+        
+        if cgf:
+            x_0, _ = torch.chunk(x_t, 2, 0)
+        else:
+            x_0 = x_t
 
     model.train()
 
-    return x_t    
+    return x_0
 
 #
 # Training
 #
 
-accelerator = Accelerator(
-    mixed_precision='fp16'
-)
-
+accelerator = Accelerator(mixed_precision='fp16')
 
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
@@ -193,20 +180,14 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
 
         total_loss = 0
 
-        next_batch = next(data_generator)
-        next_batch = [ _.cuda(non_blocking=True) for _ in next_batch ]
-
         for batch_idx in range(batches_per_epoch):
 
             # Get next batch
 
-            batch = next_batch
-            if batch_idx < batches_per_epoch - 1:
-                next_batch = next(data_generator)
-                next_batch = [ _.cuda(non_blocking=True) for _ in next_batch]
-    
-            mean, logvar = batch
+            mean, logvar, dict = next(data_generator)
             mean, logvar = mean.to(device), logvar.to(device)
+
+            cond = dict['y']
 
             # Sample image from latent space
 
@@ -223,7 +204,7 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
 
             # Forward pass: Predict the noise residuals
 
-            predicted_noise = model(x_t, timesteps, enable_mask=True)
+            predicted_noise = model(x_t, timesteps, cond, enable_mask=True)
 
             # Min-SNR: https://arxiv.org/pdf/2303.09556.pdf
 
@@ -268,16 +249,17 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
         except Exception as e:
             print(f"Error saving model: {e}")
 
-        try:
-            # Evaluate
-            x_0 = gen_samples(unwrapped_model, noise_scheduler)
-            decoded = decode(x_0)
+        if not args.no_eval:
+            try:
+                # Evaluate
+                x_0 = gen_samples(unwrapped_model, noise_scheduler)
+                decoded = decode(x_0)
 
-            name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
-            path = os.path.join(logdir, name)
-            save_sample(decoded, path)
-        except Exception as e:
-            print(f"Error generating sample: {e}")
+                name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+                path = os.path.join(logdir, name)
+                save_sample(decoded, path)
+            except Exception as e:
+                print(f"Error generating sample: {e}")
 
 train_loop(model, optimizer, dataloader, noise_scheduler)
 
