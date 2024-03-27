@@ -5,16 +5,17 @@ import os
 import datetime
 import numpy as np
 from tqdm.auto import tqdm
-import torch.nn as nn
 
 import latent_dataset
 from torchvision.utils import save_image
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from accelerate import Accelerator
 from adan import Adan
+import diffusers 
 from diffusers.models import AutoencoderKL
-from diffusers import DDIMScheduler, DDPMScheduler
+from diffusers import DDIMScheduler
 from diffusers.training_utils import compute_snr
 
 from mdtv2 import MDTv2
@@ -29,9 +30,9 @@ argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
 argparser.add_argument('--mask-ratio', type=float, default=0.3)
-argparser.add_argument('--batch-size', type=int, default=16)
-argparser.add_argument('--epochs', type=int, default=256)
-argparser.add_argument('--steps-per-epoch', type=int, default=10000)
+argparser.add_argument('--batch-size', type=int, default=32)
+argparser.add_argument('--epochs', type=int, default=512)
+argparser.add_argument('--steps-per-epoch', type=int, default=9984)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--gen-only', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -47,8 +48,37 @@ os.makedirs(logdir, exist_ok=True)
 # Dataset
 #
 
+class BlockRandomSampler(torch.utils.data.Sampler):
+    def __init__(self, data_source, batch_size):
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.num_samples = len(data_source)
+        self.num_batches = self.num_samples // batch_size
+        self.total_size = self.num_batches * batch_size
+
+        self.generator = torch.Generator()
+        self.generator.manual_seed(args.seed)
+
+    def __iter__(self):
+        offset = torch.randint(0, self.batch_size, (1,)).item() # For better shuffling
+        batch_indices = torch.randperm(self.num_batches - 1, generator=self.generator).tolist()
+
+        for i in batch_indices:
+            batch_start_idx = i * self.batch_size + offset
+            yield from range(batch_start_idx, batch_start_idx + self.batch_size)
+
+    def __len__(self):
+        return self.total_size
+    
 dataset = latent_dataset.LatentImageDataset(args.data_dir)
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+sampler = BlockRandomSampler(dataset, args.batch_size)
+dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, pin_memory=True)
+
+def dataloader_generator(dataloader):
+    while True:
+        yield from dataloader
+
+
 
 #
 # Autoencoder
@@ -85,15 +115,13 @@ def decode(z) -> torch.Tensor:
     return x
 
 def save_sample(x, path):
-    save_image(x, path, nrow=3, normalize=True, value_range=(-1, 1))
+    save_image(x, path, normalize=True, value_range=(-1, 1))
 
 #
 # Denoising Model
 #
-#model: MDTv2 = MDTv2(depth=6, hidden_size=96, patch_size=2, num_heads=4, learn_sigma=False, mask_ratio=args.mask_ratio)
+
 model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, learn_sigma=False, mask_ratio=args.mask_ratio)
-#model: MDTv2 = MDTv2(depth=12, hidden_size=768, patch_size=2, num_heads=12, learn_sigma=False, mask_ratio=args.mask_ratio)
-#model: MDTv2 = MDTv2(depth=24, hidden_size=1024, patch_size=2, num_heads=16, learn_sigma=False, mask_ratio=args.mask_ratio)
 model = model.to(device)
 
 if args.resume_path is not None:
@@ -104,37 +132,34 @@ if args.resume_path is not None:
 # Diffusion
 #
 
-scheduler = DDIMScheduler()
+num_train_timesteps = 1000
+noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
 
 #
 # Sampling
 #
 
-def gen_img(model, scheduler):
+def gen_samples(model, noise_scheduler, num_samples = 8):
     model.eval()
 
     with torch.no_grad():
 
-        x_t = torch.randn(9, 4, 32, 32, device=device)
+        x_t = torch.randn(num_samples, 4, 32, 32, device=device)
 
-        scheduler.set_timesteps(50)
+        noise_scheduler.set_timesteps(50)
 
-        for t in tqdm(scheduler.timesteps, desc="Sampling"):
+        for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
             # predict the noise residual
             with torch.no_grad():
                 tt = torch.tensor([t], device=device)
                 noise_pred = model(x_t, tt)
 
             # compute the previous noisy sample x_t -> x_t-1
-            x_t = scheduler.step(noise_pred, t, x_t).prev_sample
-
-        # Decode
-        
-        decoded = decode(x_t)
+            x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
 
     model.train()
 
-    return decoded    
+    return x_t    
 
 #
 # Training
@@ -144,31 +169,43 @@ accelerator = Accelerator(
     mixed_precision='fp16'
 )
 
+
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
-def train_loop(model, optimizer, dataloader, scheduler):
+def train_loop(model, optimizer, dataloader, noise_scheduler):
     
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     batch_size = args.batch_size
-
     steps_per_epoch = args.steps_per_epoch
     batches_per_epoch = steps_per_epoch // batch_size
+    
     epochs = args.epochs
 
     print(f"Steps per epoch: {steps_per_epoch}, Epochs: {epochs}")
 
-    for i in range(epochs):
+    data_generator = dataloader_generator(dataloader)
+
+    for epoch in range(epochs):
         # Run for batches_per_epoch batches
 
-        pbar = tqdm(desc=f"Epoch {i}", total=steps_per_epoch)
+        pbar = tqdm(desc=f"Epoch {epoch}", total=steps_per_epoch)
 
         total_loss = 0
 
-        for i in range(batches_per_epoch):
-            # Get batch
+        next_batch = next(data_generator)
+        next_batch = [ _.cuda(non_blocking=True) for _ in next_batch ]
+
+        for batch_idx in range(batches_per_epoch):
+
+            # Get next batch
+
+            batch = next_batch
+            if batch_idx < batches_per_epoch - 1:
+                next_batch = next(data_generator)
+                next_batch = [ _.cuda(non_blocking=True) for _ in next_batch]
     
-            mean, logvar = next(iter(dataloader))
+            mean, logvar = batch
             mean, logvar = mean.to(device), logvar.to(device)
 
             # Sample image from latent space
@@ -178,11 +215,11 @@ def train_loop(model, optimizer, dataloader, scheduler):
             # Sample random noise & timesteps
 
             noise = torch.randn(x_0.shape, device=device)
-            timesteps = torch.randint(0, 1000, (x_0.shape[0],), device=device)
+            timesteps = torch.randint(0, num_train_timesteps, (x_0.shape[0],), device=device)
 
             # Add noise
 
-            x_t = scheduler.add_noise(x_0, noise, timesteps)
+            x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
 
             # Forward pass: Predict the noise residuals
 
@@ -190,17 +227,11 @@ def train_loop(model, optimizer, dataloader, scheduler):
 
             # Min-SNR: https://arxiv.org/pdf/2303.09556.pdf
 
-            snr = compute_snr(scheduler, timesteps)
+            snr = compute_snr(noise_scheduler, timesteps)
 
             base_weight = (torch.stack([snr, 5 * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr)
 
-            if scheduler.config.prediction_type == "v_prediction":
-                # Velocity objective needs to be floored to an SNR weight of one.
-                mse_loss_weights = base_weight + 1
-            else:
-                # Epsilon and sample both use the same loss weights.
-                mse_loss_weights = base_weight
-
+            mse_loss_weights = base_weight
             mse_loss_weights[snr == 0] = 1.0
 
             # Calculate loss
@@ -224,28 +255,31 @@ def train_loop(model, optimizer, dataloader, scheduler):
             total_loss += loss.detach().item()
 
             pbar.update(batch_size)
+            pbar.set_postfix({"Loss": total_loss / (batch_idx + 1)})
         
         
-        pbar.set_postfix({"Loss": total_loss / (i + 1)})
         pbar.close()
+
+        unwrapped_model = accelerator.unwrap_model(model)
         
         # Save model
         try:
-            torch.save(model.state_dict(), 'model.pth')
+            torch.save(unwrapped_model.state_dict(), 'model.pth')
         except Exception as e:
             print(f"Error saving model: {e}")
 
         try:
             # Evaluate
-            gen = gen_img(model, scheduler)
+            x_0 = gen_samples(unwrapped_model, noise_scheduler)
+            decoded = decode(x_0)
 
             name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
             path = os.path.join(logdir, name)
-            save_sample(gen, path)
+            save_sample(decoded, path)
         except Exception as e:
             print(f"Error generating sample: {e}")
 
-train_loop(model, optimizer, dataloader, scheduler)
+train_loop(model, optimizer, dataloader, noise_scheduler)
 
 
         
