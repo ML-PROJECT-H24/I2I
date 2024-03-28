@@ -30,7 +30,7 @@ argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
 argparser.add_argument('--mask-ratio', type=float, default=0.3)
-argparser.add_argument('--batch-size', type=int, default=32)
+argparser.add_argument('--batch-size', type=int, default=16)
 argparser.add_argument('--epochs', type=int, default=512)
 argparser.add_argument('--samples-per-epoch', type=int, default=None)
 argparser.add_argument('--resume-path', type=str, default=None)
@@ -102,21 +102,11 @@ def save_sample(x, path):
 
 num_classes = args.num_classes
 
-# model: MDTv2 = MDTv2(
-#     depth=12, 
-#     hidden_size=384, 
-#     patch_size=2, 
-#     num_heads=6, 
-#     num_classes=num_classes, 
-#     learn_sigma=False, 
-#     mask_ratio=args.mask_ratio,
-#     class_dropout_prob=0)
-
 model: MDTv2 = MDTv2(
     depth=12, 
-    hidden_size=768, 
+    hidden_size=384, 
     patch_size=2, 
-    num_heads=12, 
+    num_heads=6, 
     num_classes=num_classes, 
     learn_sigma=False, 
     mask_ratio=args.mask_ratio,

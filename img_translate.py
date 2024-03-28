@@ -108,8 +108,16 @@ def save_sample(x, path):
 # Denoising Model
 #
 
-num_classes = 1000
-model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, num_classes=num_classes, learn_sigma=False)
+model: MDTv2 = MDTv2(
+    depth=12, 
+    hidden_size=384, 
+    patch_size=2, 
+    num_heads=6, 
+    num_classes=2, 
+    learn_sigma=False, 
+    mask_ratio=args.mask_ratio,
+    class_dropout_prob=0)
+
 model = model.to(device)
 
 model.load_state_dict(torch.load(args.model_path))
