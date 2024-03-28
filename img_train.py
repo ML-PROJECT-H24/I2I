@@ -25,14 +25,14 @@ from mdtv2 import MDTv2
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--data-dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
-argparser.add_argument('--num-actual-classes', type=int, default=1000)
+argparser.add_argument('--num-classes', type=int, default=1000)
 argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
 argparser.add_argument('--mask-ratio', type=float, default=0.3)
 argparser.add_argument('--batch-size', type=int, default=32)
 argparser.add_argument('--epochs', type=int, default=512)
-argparser.add_argument('--steps-per-epoch', type=int, default=9984)
+argparser.add_argument('--samples-per-epoch', type=int, default=None)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--no-eval', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -48,7 +48,12 @@ os.makedirs(logdir, exist_ok=True)
 # Dataset
 #
 
+print(f"Loading dataset from {args.data_dir}")
+
 dataset = latent_dataset.LatentImageDataset(args.data_dir)
+
+print(f"Loaded {len(dataset)} samples")
+
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
 def dataloader_generator(dataloader):
@@ -95,9 +100,28 @@ def save_sample(x, path):
 # Denoising Model
 #
 
-num_classes = 1000
-model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
-#model: MDTv2 = MDTv2(depth=12, hidden_size=768, patch_size=2, num_heads=12, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
+num_classes = args.num_classes
+
+# model: MDTv2 = MDTv2(
+#     depth=12, 
+#     hidden_size=384, 
+#     patch_size=2, 
+#     num_heads=6, 
+#     num_classes=num_classes, 
+#     learn_sigma=False, 
+#     mask_ratio=args.mask_ratio,
+#     class_dropout_prob=0)
+
+model: MDTv2 = MDTv2(
+    depth=12, 
+    hidden_size=768, 
+    patch_size=2, 
+    num_heads=12, 
+    num_classes=num_classes, 
+    learn_sigma=False, 
+    mask_ratio=args.mask_ratio,
+    class_dropout_prob=0)
+
 model = model.to(device)
 
 if args.resume_path is not None:
@@ -115,20 +139,18 @@ noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
 # Sampling
 #
 
-def gen_samples(model, noise_scheduler, num_samples = 8, cgf=False):
+def gen_samples(model, noise_scheduler, num_samples = 8):
     model.eval()
 
     with torch.no_grad():
 
         x_t = torch.randn(num_samples, 4, 32, 32, device=device)
-        classes_rand = torch.randint(0, args.num_actual_classes, (num_samples,), device=device)
-
-        if cgf: # Classifier free guidance
-            classes_null = torch.tensor([num_classes] * num_samples, device=device)
-            classes_all = torch.cat([classes_rand, classes_null], 0)
-            x_t = torch.cat([x_t, x_t], 0)
-        else: # Random classes
-            classes_all = classes_rand
+        
+        if num_classes == 2:
+            half = num_samples // 2
+            classes_rand = torch.cat([torch.zeros(half), torch.ones(num_samples - half)], dim=0).long().to(device)
+        else:
+            classes_rand = torch.randint(0, num_classes, (num_samples,), device=device)
 
         noise_scheduler.set_timesteps(50)
 
@@ -137,19 +159,14 @@ def gen_samples(model, noise_scheduler, num_samples = 8, cgf=False):
             with torch.no_grad():
                 # Classifier free guidance
                 tt = torch.tensor([t], device=device)
-                noise_pred = model.forward_with_cfg(x_t, tt, classes_all)
+                noise_pred = model(x_t, tt, classes_rand, enable_mask=False)
 
             # compute the previous noisy sample x_t -> x_t-1
             x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
-        
-        if cgf:
-            x_0, _ = torch.chunk(x_t, 2, 0)
-        else:
-            x_0 = x_t
 
     model.train()
 
-    return x_0
+    return x_t
 
 #
 # Training
@@ -164,12 +181,14 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     batch_size = args.batch_size
-    steps_per_epoch = args.steps_per_epoch
+    steps_per_epoch = args.samples_per_epoch if args.samples_per_epoch is not None else len(dataloader) * batch_size
     batches_per_epoch = steps_per_epoch // batch_size
     
     epochs = args.epochs
 
-    print(f"Steps per epoch: {steps_per_epoch}, Epochs: {epochs}")
+    print(f"Samples per epoch: {steps_per_epoch}")
+    print(f"Steps per epoch: {batches_per_epoch}")
+    print(f"Total epochs: {epochs}")
 
     data_generator = dataloader_generator(dataloader)
 
@@ -187,7 +206,7 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
             mean, logvar, dict = next(data_generator)
             mean, logvar = mean.to(device), logvar.to(device)
 
-            cond = dict['y']
+            cond = dict['y'] % num_classes
 
             # Sample image from latent space
 
@@ -223,7 +242,6 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
 
             # Backward pass
 
-            #loss.backward()
             accelerator.backward(loss)
 
             # Update weights
@@ -245,7 +263,7 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
         
         # Save model
         try:
-            torch.save(unwrapped_model.state_dict(), 'model.pth')
+            torch.save(unwrapped_model.state_dict(), os.path.join(logdir, f"model.pt"))
         except Exception as e:
             print(f"Error saving model: {e}")
 

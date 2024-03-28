@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 
 import latent_dataset
 from torchvision.utils import save_image
+import torchvision
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
@@ -25,8 +26,10 @@ from mdtv2 import MDTv2
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--model-path', type=str, default=None)
-argparser.add_argument('--num-samples', type=int, default=4)
-argparser.add_argument('--num-iterations', type=int, default=100)
+argparser.add_argument('--src-img-path', type=str, default=None)
+argparser.add_argument('--start-t', type=int, default=200)
+argparser.add_argument('--num-inference-steps', type=int, default=50)
+argparser.add_argument('--cond', type=int, default=0)
 argparser.add_argument('--logdir', type=str, default='logs')
 
 args = argparser.parse_args()
@@ -35,6 +38,35 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 logdir = os.path.join(args.logdir, datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
 os.makedirs(logdir, exist_ok=True)
+
+#
+# Load Image
+#
+
+def center_crop_square(image: torch.Tensor):
+    # Crop center of image to be square using pytorch
+    _, width, height = image.shape
+    new_size = min(width, height)
+
+    left = (width - new_size) // 2
+    top = (height - new_size) // 2
+    right = (width + new_size) // 2
+    bottom = (height + new_size) // 2
+
+    return image[:, left:right, top:bottom]
+
+def resize_square(image: torch.Tensor, size: int): 
+  return torchvision.transforms.functional.resize(image, size, interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
+
+image_file = args.src_img_path
+TARGET_SIZE = 256
+
+image = torchvision.io.read_image(image_file, mode=torchvision.io.image.ImageReadMode.RGB)
+image = image.to(device=device, dtype=torch.float32)
+image = center_crop_square(image)
+image = resize_square(image, TARGET_SIZE)
+image = (image / 127.5) - 1
+image = image.unsqueeze(0)  
 
 #
 # Autoencoder
@@ -77,11 +109,9 @@ def save_sample(x, path):
 #
 
 num_classes = 1000
-model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
-#model: MDTv2 = MDTv2(depth=12, hidden_size=768, patch_size=2, num_heads=12, num_classes=num_classes, learn_sigma=False, mask_ratio=args.mask_ratio)
+model: MDTv2 = MDTv2(depth=12, hidden_size=384, patch_size=2, num_heads=6, num_classes=num_classes, learn_sigma=False)
 model = model.to(device)
 
-print(f'Model from {args.resume_path}')
 model.load_state_dict(torch.load(args.model_path))
 
 #
@@ -92,51 +122,62 @@ num_train_timesteps = 1000
 noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
 
 #
-# Sampling
+# Translation
 #
 
-def gen_samples(model, noise_scheduler, num_samples = 8, cgf=False):
+def translate(model, x_0, noise_scheduler):
     model.eval()
 
+    images = [x_0]
+
+    # Add noise to the image
+
+    start_t = args.start_t - 1
+
+    noise = torch.randn(1, 4, 32, 32, device=device)
+    timesteps = torch.tensor([start_t], device=device)
+    cond = torch.tensor([args.cond], device=device)
+    
+    x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
+
+    images.append(x_t)
+
+    # Conditionally sample the noise
+
     with torch.no_grad():
+        noise_scheduler.num_inference_steps = args.num_inference_steps
 
-        x_t = torch.randn(num_samples, 4, 32, 32, device=device)
-        classes_rand = torch.randint(0, num_classes, (num_samples,), device=device)
+        step_ratio = start_t // args.num_inference_steps
 
-        if cgf: # Classifier free guidance
-            classes_null = torch.tensor([num_classes] * num_samples, device=device)
-            classes_all = torch.cat([classes_rand, classes_null], 0)
-            x_t = torch.cat([x_t, x_t], 0)
-        else: # Random classes
-            classes_all = classes_rand
-
-        noise_scheduler.set_timesteps(args.num_iterations)
+        timesteps = (np.arange(0, args.num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        noise_scheduler.timesteps = torch.from_numpy(timesteps).to(device)
 
         for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
-            # predict the noise residual
             with torch.no_grad():
-                # Classifier free guidance
                 tt = torch.tensor([t], device=device)
-                noise_pred = model.forward_with_cfg(x_t, tt, classes_all)
+                noise_pred = model(x_t, tt, cond, enable_mask=False)
 
             # compute the previous noisy sample x_t -> x_t-1
             x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
-        
-        if cgf:
-            x_0, _ = torch.chunk(x_t, 2, 0)
-        else:
-            x_0 = x_t
+
+            images.append(x_t)
 
     model.train()
 
-    return x_0
+    # Add all images into a single tensor
+    return images
 
-samples = gen_samples(model, noise_scheduler, num_samples=args.num_samples, cgf=False)
 
-decoded = decode(samples)
+mean, logvar = encode(image)
+image = sample(mean, logvar)
+images = translate(model, image, noise_scheduler)
 
-for i in range(args.num_samples):
-    save_sample(decoded[i], os.path.join(logdir, f'sample_{i}.png'))
+for i, image in enumerate(images):
+    decoded = decode(image)
+    save_sample(decoded, os.path.join(logdir, f'sample_{i}.png'))
+
+
+
 
 
         
