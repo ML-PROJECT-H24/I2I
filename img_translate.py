@@ -1,23 +1,15 @@
 import argparse
 import torch
-import PIL 
 import os
 import datetime
 import numpy as np
 from tqdm.auto import tqdm
 
-import latent_dataset
 from torchvision.utils import save_image
 import torchvision
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
-from accelerate import Accelerator
-from adan import Adan
 from diffusers.models import AutoencoderKL
-from diffusers import DDIMScheduler
-from diffusers.training_utils import compute_snr
-
+from gaussian_diffusion import *
 from mdtv2 import MDTv2
 
 #
@@ -27,7 +19,7 @@ from mdtv2 import MDTv2
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--model-path', type=str, default=None)
 argparser.add_argument('--src-img-path', type=str, default=None)
-argparser.add_argument('--start-t', type=int, default=200)
+argparser.add_argument('--strength', type=float, default=0.5)
 argparser.add_argument('--num-inference-steps', type=int, default=50)
 argparser.add_argument('--cond', type=int, default=0)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -114,9 +106,8 @@ model: MDTv2 = MDTv2(
     patch_size=2, 
     num_heads=6, 
     num_classes=2, 
-    learn_sigma=False, 
-    mask_ratio=args.mask_ratio,
-    class_dropout_prob=0)
+    learn_sigma=False,
+    class_dropout_prob=0.0)
 
 model = model.to(device)
 
@@ -126,8 +117,15 @@ model.load_state_dict(torch.load(args.model_path))
 # Diffusion
 #
 
-num_train_timesteps = 1000
-noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
+num_timesteps = 1000
+betas = get_named_beta_schedule("linear", num_timesteps)
+spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts=str(num_timesteps))
+diffusion: SpacedDiffusion = SpacedDiffusion(
+    use_timesteps=spaced_timesteps,
+    betas=betas, 
+    model_mean_type=ModelMeanType.EPSILON, 
+    model_var_type=ModelVarType.LEARNED_RANGE, 
+    loss_type=LossType.MSE)
 
 #
 # Translation
@@ -138,27 +136,36 @@ def translate(model, x_0, noise_scheduler):
 
     images = [x_0]
 
-    # Add noise to the image
-
-    start_t = args.start_t - 1
-
-    noise = torch.randn(1, 4, 32, 32, device=device)
-    timesteps = torch.tensor([start_t], device=device)
-    cond = torch.tensor([args.cond], device=device)
-    
-    x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
-
-    images.append(x_t)
-
-    # Conditionally sample the noise
-
     with torch.no_grad():
-        noise_scheduler.num_inference_steps = args.num_inference_steps
+        # Add noise to the image
+        
+        t_enc = int((args.num_inference_steps - 1) * args.strength)
+        step_ratio = 1000 // args.num_inference_steps
 
-        step_ratio = start_t // args.num_inference_steps
+        print(f"Encoding for {t_enc} steps, then sampling for {args.num_inference_steps - t_enc} steps")
 
-        timesteps = (np.arange(0, args.num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-        noise_scheduler.timesteps = torch.from_numpy(timesteps).to(device)
+        timesteps = np.flip(np.arange(args.num_inference_steps)[:t_enc]) * step_ratio
+        timesteps = torch.tensor(timesteps, device=device)
+
+        t_start = timesteps[0]
+
+        print(f"timesteps: {timesteps}")
+
+        noise = torch.randn(1, 4, 32, 32, device=device)
+        cond = torch.tensor([args.cond], device=device)
+
+        print(f"cond: {cond}")
+
+        x_t = noise_scheduler.add_noise(x_0, noise, t_start)
+
+        print(f"t_start: {t_start}")
+
+        images.append(x_t)
+
+        noise_scheduler.num_inference_steps = t_enc + 1
+        noise_scheduler.timesteps = timesteps
+
+        #noise_scheduler.set_timesteps(args.num_inference_steps)
 
         for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
             with torch.no_grad():

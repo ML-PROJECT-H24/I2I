@@ -1,9 +1,9 @@
 import argparse
 import torch
-import PIL 
 import os
 import datetime
 import numpy as np
+import functools
 from tqdm.auto import tqdm
 
 import latent_dataset
@@ -14,8 +14,7 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from adan import Adan
 from diffusers.models import AutoencoderKL
-from diffusers import DDIMScheduler
-from diffusers.training_utils import compute_snr
+from gaussian_diffusion import *
 
 from mdtv2 import MDTv2
 
@@ -25,7 +24,7 @@ from mdtv2 import MDTv2
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--data-dir', type=str, default='data/LATENT_DATASET/LATENT_DATASET')
-argparser.add_argument('--num-classes', type=int, default=1000)
+argparser.add_argument('--num-classes', type=int, default=2)
 argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
@@ -108,7 +107,7 @@ model: MDTv2 = MDTv2(
     patch_size=2, 
     num_heads=6, 
     num_classes=num_classes, 
-    learn_sigma=False, 
+    learn_sigma=True, 
     mask_ratio=args.mask_ratio,
     class_dropout_prob=0)
 
@@ -122,14 +121,21 @@ if args.resume_path is not None:
 # Diffusion
 #
 
-num_train_timesteps = 1000
-noise_scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
+num_timesteps = 1000
+betas = get_named_beta_schedule("linear", num_timesteps)
+spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts=str(num_timesteps))
+diffusion: SpacedDiffusion = SpacedDiffusion(
+    use_timesteps=spaced_timesteps,
+    betas=betas, 
+    model_mean_type=ModelMeanType.EPSILON, 
+    model_var_type=ModelVarType.LEARNED_RANGE, 
+    loss_type=LossType.MSE)
 
 #
 # Sampling
 #
 
-def gen_samples(model, noise_scheduler, num_samples = 8):
+def gen_samples(model, diffusion: GaussianDiffusion, num_samples = 8):
     model.eval()
 
     with torch.no_grad():
@@ -142,21 +148,20 @@ def gen_samples(model, noise_scheduler, num_samples = 8):
         else:
             classes_rand = torch.randint(0, num_classes, (num_samples,), device=device)
 
-        noise_scheduler.set_timesteps(50)
+        model_kwargs = {"y": classes_rand, "enable_mask": False}
 
-        for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
-            # predict the noise residual
-            with torch.no_grad():
-                # Classifier free guidance
-                tt = torch.tensor([t], device=device)
-                noise_pred = model(x_t, tt, classes_rand, enable_mask=False)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
+        sample = diffusion.p_sample_loop(
+            model,
+            x_t.shape, 
+            x_t, 
+            clip_denoised=False, 
+            model_kwargs=model_kwargs,
+            progress=True, 
+            device=device)
 
     model.train()
 
-    return x_t
+    return sample
 
 #
 # Training
@@ -166,7 +171,7 @@ accelerator = Accelerator(mixed_precision='fp16')
 
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
-def train_loop(model, optimizer, dataloader, noise_scheduler):
+def train_loop(model: MDTv2, optimizer, dataloader: DataLoader, diffusion: GaussianDiffusion):
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
@@ -188,49 +193,39 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
         pbar = tqdm(desc=f"Epoch {epoch}", total=steps_per_epoch)
 
         total_loss = 0
+        total_mse = 0
+        total_vb = 0
 
         for batch_idx in range(batches_per_epoch):
-
             # Get next batch
 
             mean, logvar, dict = next(data_generator)
             mean, logvar = mean.to(device), logvar.to(device)
 
             cond = dict['y'] % num_classes
+            cond = cond.to(device)
 
             # Sample image from latent space
 
             x_0 = sample(mean, logvar)
 
-            # Sample random noise & timesteps
+            # Get random timestep
 
-            noise = torch.randn(x_0.shape, device=device)
-            timesteps = torch.randint(0, num_train_timesteps, (x_0.shape[0],), device=device)
+            timesteps = torch.randint(0, num_timesteps, (batch_size,), device=device)
 
-            # Add noise
+            # Compute losses
 
-            x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
+            model_kwargs = {"y": cond, "enable_mask": False}
+            losses_unmasked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
 
-            # Forward pass: Predict the noise residuals
+            model_kwargs = {"y": cond, "enable_mask": True}
+            losses_masked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
 
-            predicted_noise = model(x_t, timesteps, cond, enable_mask=True)
+            loss = losses_unmasked["loss"].mean() + losses_masked["loss"].mean()
+            mse = losses_unmasked["mse"].mean() + losses_masked["mse"].mean()
+            vb = losses_unmasked["vb"].mean() + losses_masked["vb"].mean()
 
-            # Min-SNR: https://arxiv.org/pdf/2303.09556.pdf
-
-            snr = compute_snr(noise_scheduler, timesteps)
-
-            base_weight = (torch.stack([snr, 5 * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr)
-
-            mse_loss_weights = base_weight
-            mse_loss_weights[snr == 0] = 1.0
-
-            # Calculate loss
-
-            loss = F.mse_loss(predicted_noise, noise, reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
-
-            # Backward pass
+            # Backpropagate
 
             accelerator.backward(loss)
 
@@ -242,9 +237,13 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
             # Update progress bar
 
             total_loss += loss.detach().item()
+            total_mse += mse.detach().item()
+            total_vb += vb.detach().item()
 
             pbar.update(batch_size)
-            pbar.set_postfix({"Loss": total_loss / (batch_idx + 1)})
+            pbar.set_postfix({"Loss": total_loss / (batch_idx + 1),
+                              "MSE": total_mse / (batch_idx + 1), 
+                              "VB": total_vb / (batch_idx + 1)})
         
         
         pbar.close()
@@ -260,7 +259,7 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
         if not args.no_eval:
             try:
                 # Evaluate
-                x_0 = gen_samples(unwrapped_model, noise_scheduler)
+                x_0 = gen_samples(unwrapped_model, diffusion)
                 decoded = decode(x_0)
 
                 name = f"generated_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
@@ -269,7 +268,7 @@ def train_loop(model, optimizer, dataloader, noise_scheduler):
             except Exception as e:
                 print(f"Error generating sample: {e}")
 
-train_loop(model, optimizer, dataloader, noise_scheduler)
+train_loop(model, optimizer, dataloader, diffusion)
 
 
         
