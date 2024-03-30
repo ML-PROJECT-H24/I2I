@@ -1,6 +1,7 @@
 import argparse
 import torch
 import os
+import sys
 import datetime
 import numpy as np
 import functools
@@ -30,8 +31,7 @@ argparser.add_argument('--lr', type=float, default=3e-4)
 argparser.add_argument('--weight-decay', type=float, default=0)
 argparser.add_argument('--mask-ratio', type=float, default=0.3)
 argparser.add_argument('--batch-size', type=int, default=16)
-argparser.add_argument('--epochs', type=int, default=512)
-argparser.add_argument('--samples-per-epoch', type=int, default=None)
+argparser.add_argument('--steps-per-epoch', type=int, default=100)
 argparser.add_argument('--resume-path', type=str, default=None)
 argparser.add_argument('--no-eval', action='store_true', default=False)
 argparser.add_argument('--logdir', type=str, default='logs')
@@ -116,6 +116,9 @@ model = model.to(device)
 if args.resume_path is not None:
     print(f'Resuming from {args.resume_path}')
     model.load_state_dict(torch.load(args.resume_path))
+    
+if sys.platform == 'linux' or sys.platform == 'linux2':
+    model = torch.compile(model)
 
 #
 # Diffusion
@@ -167,7 +170,10 @@ def gen_samples(model, diffusion: GaussianDiffusion, num_samples = 8):
 # Training
 #
 
-accelerator = Accelerator(mixed_precision='fp16')
+target_batch_size = 256
+accumulation_steps = target_batch_size // args.batch_size
+
+accelerator = Accelerator(mixed_precision='fp16', gradient_accumulation_steps=accumulation_steps)
 
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
@@ -176,21 +182,19 @@ def train_loop(model: MDTv2, optimizer, dataloader: DataLoader, diffusion: Gauss
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     batch_size = args.batch_size
-    steps_per_epoch = args.samples_per_epoch if args.samples_per_epoch is not None else len(dataloader) * batch_size
-    batches_per_epoch = steps_per_epoch // batch_size
-    
-    epochs = args.epochs
-
-    print(f"Samples per epoch: {steps_per_epoch}")
-    print(f"Steps per epoch: {batches_per_epoch}")
-    print(f"Total epochs: {epochs}")
+    steps_per_epoch = args.steps_per_epoch
+    batches_per_epoch = steps_per_epoch * accumulation_steps
 
     data_generator = dataloader_generator(dataloader)
 
-    for epoch in range(epochs):
-        # Run for batches_per_epoch batches
+    samples = 0
 
-        pbar = tqdm(desc=f"Epoch {epoch}", total=steps_per_epoch)
+    while True:
+        # Run for batches_per_epoch batches
+        
+        step = samples // target_batch_size
+
+        pbar = tqdm(desc=f"Step {step}", total=args.steps_per_epoch)
 
         total_loss = 0
         total_mse = 0
@@ -199,52 +203,52 @@ def train_loop(model: MDTv2, optimizer, dataloader: DataLoader, diffusion: Gauss
         for batch_idx in range(batches_per_epoch):
             # Get next batch
 
-            mean, logvar, dict = next(data_generator)
-            mean, logvar = mean.to(device), logvar.to(device)
+            with accelerator.accumulate(model):
+                mean, logvar, dict = next(data_generator)
+                cond = dict['y'] % num_classes
 
-            cond = dict['y'] % num_classes
-            cond = cond.to(device)
+                # Sample image from latent space
 
-            # Sample image from latent space
+                x_0 = sample(mean, logvar)
 
-            x_0 = sample(mean, logvar)
+                # Get random timestep
 
-            # Get random timestep
+                timesteps = torch.randint(0, num_timesteps, (batch_size,), device=device)
 
-            timesteps = torch.randint(0, num_timesteps, (batch_size,), device=device)
+                # Compute losses
 
-            # Compute losses
+                model_kwargs = {"y": cond, "enable_mask": False}
+                losses_unmasked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
 
-            model_kwargs = {"y": cond, "enable_mask": False}
-            losses_unmasked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
+                model_kwargs = {"y": cond, "enable_mask": True}
+                losses_masked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
 
-            model_kwargs = {"y": cond, "enable_mask": True}
-            losses_masked = diffusion.training_losses(model, x_0, timesteps, model_kwargs)
+                loss = losses_unmasked["loss"].mean() + losses_masked["loss"].mean()
+                mse = losses_unmasked["mse"].mean() + losses_masked["mse"].mean()
+                vb = losses_unmasked["vb"].mean() + losses_masked["vb"].mean()
 
-            loss = losses_unmasked["loss"].mean() + losses_masked["loss"].mean()
-            mse = losses_unmasked["mse"].mean() + losses_masked["mse"].mean()
-            vb = losses_unmasked["vb"].mean() + losses_masked["vb"].mean()
+                # Backpropagate
 
-            # Backpropagate
+                accelerator.backward(loss)
 
-            accelerator.backward(loss)
+                # Update weights
 
-            # Update weights
-            
-            optimizer.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                optimizer.zero_grad()
 
-            # Update progress bar
+                # Update progress bar
 
-            total_loss += loss.detach().item()
-            total_mse += mse.detach().item()
-            total_vb += vb.detach().item()
+                total_loss += loss.detach().item()
+                total_mse += mse.detach().item()
+                total_vb += vb.detach().item()
 
-            pbar.update(batch_size)
+                samples += batch_size
+
+            if samples % target_batch_size == 0:
+                pbar.update(1)
             pbar.set_postfix({"Loss": total_loss / (batch_idx + 1),
                               "MSE": total_mse / (batch_idx + 1), 
                               "VB": total_vb / (batch_idx + 1)})
-        
         
         pbar.close()
 
