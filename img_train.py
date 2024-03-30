@@ -103,9 +103,9 @@ num_classes = args.num_classes
 
 model: MDTv2 = MDTv2(
     depth=12, 
-    hidden_size=384, 
+    hidden_size=768, 
     patch_size=2, 
-    num_heads=6, 
+    num_heads=12, 
     num_classes=num_classes, 
     learn_sigma=True, 
     mask_ratio=args.mask_ratio,
