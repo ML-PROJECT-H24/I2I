@@ -117,9 +117,6 @@ if args.resume_path is not None:
     print(f'Resuming from {args.resume_path}')
     model.load_state_dict(torch.load(args.resume_path))
     
-if sys.platform == 'linux' or sys.platform == 'linux2':
-    model = torch.compile(model)
-
 #
 # Diffusion
 #
@@ -175,8 +172,7 @@ accumulation_steps = target_batch_size // args.batch_size
 
 accelerator = Accelerator(
     mixed_precision='fp16', 
-    gradient_accumulation_steps=accumulation_steps,
-    dynamo_backend="CUDAGRAPHS")
+    gradient_accumulation_steps=accumulation_steps)
 
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
