@@ -20,7 +20,6 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument('--model-path', type=str, default=None)
 argparser.add_argument('--src-img-path', type=str, default=None)
 argparser.add_argument('--strength', type=float, default=0.5)
-argparser.add_argument('--num-inference-steps', type=int, default=50)
 argparser.add_argument('--cond', type=int, default=0)
 argparser.add_argument('--logdir', type=str, default='logs')
 
@@ -106,7 +105,7 @@ model: MDTv2 = MDTv2(
     patch_size=2, 
     num_heads=6, 
     num_classes=2, 
-    learn_sigma=False,
+    learn_sigma=True,
     class_dropout_prob=0.0)
 
 model = model.to(device)
@@ -118,8 +117,9 @@ model.load_state_dict(torch.load(args.model_path))
 #
 
 num_timesteps = 1000
+sample_steps = 100
 betas = get_named_beta_schedule("linear", num_timesteps)
-spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts=str(num_timesteps))
+spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts="ddim100")
 diffusion: SpacedDiffusion = SpacedDiffusion(
     use_timesteps=spaced_timesteps,
     betas=betas, 
@@ -131,51 +131,32 @@ diffusion: SpacedDiffusion = SpacedDiffusion(
 # Translation
 #
 
-def translate(model, x_0, noise_scheduler):
+def translate(model, x_0, diffusion: SpacedDiffusion):
     model.eval()
 
+    cond = torch.tensor([args.cond], device=device)
+    
     images = [x_0]
 
     with torch.no_grad():
         # Add noise to the image
+
+        t_enc = int((sample_steps - 1) * args.strength)
         
-        t_enc = int((args.num_inference_steps - 1) * args.strength)
-        step_ratio = 1000 // args.num_inference_steps
+        x_t = diffusion.q_sample(x_0, torch.tensor(t_enc, device=device))
 
-        print(f"Encoding for {t_enc} steps, then sampling for {args.num_inference_steps - t_enc} steps")
+        timesteps = np.flip(np.arange(sample_steps)[:t_enc])
 
-        timesteps = np.flip(np.arange(args.num_inference_steps)[:t_enc]) * step_ratio
-        timesteps = torch.tensor(timesteps, device=device)
+        for t in tqdm(timesteps, desc="Sampling"):
 
-        t_start = timesteps[0]
+            model_kwargs = {"y": cond, "enable_mask": False}
 
-        print(f"timesteps: {timesteps}")
-
-        noise = torch.randn(1, 4, 32, 32, device=device)
-        cond = torch.tensor([args.cond], device=device)
-
-        print(f"cond: {cond}")
-
-        x_t = noise_scheduler.add_noise(x_0, noise, t_start)
-
-        print(f"t_start: {t_start}")
-
-        images.append(x_t)
-
-        noise_scheduler.num_inference_steps = t_enc + 1
-        noise_scheduler.timesteps = timesteps
-
-        #noise_scheduler.set_timesteps(args.num_inference_steps)
-
-        for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
-            with torch.no_grad():
-                tt = torch.tensor([t], device=device)
-                noise_pred = model(x_t, tt, cond, enable_mask=False)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            x_t = noise_scheduler.step(noise_pred, t, x_t).prev_sample
+            tt = torch.tensor([t], device=device)
+            
+            x_t = diffusion.ddim_sample(model, x_t, tt, clip_denoised=False, model_kwargs=model_kwargs)["sample"]
 
             images.append(x_t)
+
 
     model.train()
 
@@ -185,7 +166,7 @@ def translate(model, x_0, noise_scheduler):
 
 mean, logvar = encode(image)
 image = sample(mean, logvar)
-images = translate(model, image, noise_scheduler)
+images = translate(model, image, diffusion)
 
 for i, image in enumerate(images):
     decoded = decode(image)

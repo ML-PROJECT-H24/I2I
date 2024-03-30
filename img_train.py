@@ -170,10 +170,13 @@ def gen_samples(model, diffusion: GaussianDiffusion, num_samples = 8):
 # Training
 #
 
-target_batch_size = 256
+target_batch_size = 64
 accumulation_steps = target_batch_size // args.batch_size
 
-accelerator = Accelerator(mixed_precision='fp16', gradient_accumulation_steps=accumulation_steps)
+accelerator = Accelerator(
+    mixed_precision='fp16', 
+    gradient_accumulation_steps=accumulation_steps,
+    dynamo_backend="CUDAGRAPHS")
 
 optimizer = Adan(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay, max_grad_norm=1.0, fused=True)
 
