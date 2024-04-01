@@ -20,6 +20,7 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument('--model-path', type=str, default=None)
 argparser.add_argument('--num-samples', type=int, default=8)
 argparser.add_argument('--sample-steps', type=int, default=250)
+argparser.add_argument('--seed', type=int, default=0)
 argparser.add_argument('--cond', type=int, default=0)
 argparser.add_argument('--logdir', type=str, default='logs')
 
@@ -29,6 +30,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 logdir = os.path.join(args.logdir, datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
 os.makedirs(logdir, exist_ok=True)
+
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
+torch.backends.cudnn.deterministic = True
+
 
 #
 # Autoencoder

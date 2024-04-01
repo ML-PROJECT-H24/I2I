@@ -117,9 +117,9 @@ model.load_state_dict(torch.load(args.model_path))
 #
 
 num_timesteps = 1000
-sample_steps = 100
+sample_steps = 1000
 betas = get_named_beta_schedule("linear", num_timesteps)
-spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts="ddim100")
+spaced_timesteps = space_timesteps(num_timesteps=num_timesteps, section_counts=str(1000))
 diffusion: SpacedDiffusion = SpacedDiffusion(
     use_timesteps=spaced_timesteps,
     betas=betas, 
@@ -130,6 +130,7 @@ diffusion: SpacedDiffusion = SpacedDiffusion(
 #
 # Translation
 #
+
 
 def translate(model, x_0, diffusion: SpacedDiffusion):
     model.eval()
@@ -147,15 +148,18 @@ def translate(model, x_0, diffusion: SpacedDiffusion):
 
         timesteps = np.flip(np.arange(sample_steps)[:t_enc])
 
+        collect_timesteps = np.linspace(0, t_enc, 8, dtype=int)
+
         for t in tqdm(timesteps, desc="Sampling"):
 
             model_kwargs = {"y": cond, "enable_mask": False}
 
             tt = torch.tensor([t], device=device)
             
-            x_t = diffusion.ddim_sample(model, x_t, tt, clip_denoised=False, model_kwargs=model_kwargs)["sample"]
+            x_t = diffusion.p_sample(model, x_t, tt, clip_denoised=False, model_kwargs=model_kwargs)["sample"]
 
-            images.append(x_t)
+            if t in collect_timesteps:
+                images.append(x_t)
 
 
     model.train()
