@@ -6,6 +6,7 @@
 - `logs\`: Contains all logs for experiments
 - `requirements.txt`: PIP requirements for this project
 - `latent_dataset_creator.ipynb`: Notebook for creating latent datasets
+- `latent_selfie2anime.zip`: Premade latent dataset for selfie2anime
 - `gaussian_diffusion.py`: Diffusion algorithms from OpenAI
 - `mdtv2.py`: Official MDTv2 architecture
 - `latent_dataset.py`: Custom pytorch dataset object for latent datasets
@@ -18,7 +19,7 @@
 1. Find a dataset to you want to transform
 2. Run the latent dataset creator with your dataset
 
-Since the selfie2anime dataset is small enough, we provide the latent dataset `data\latent_selfie2anime`. So there is no need to create a latent dataset to test this repo.
+Since the selfie2anime dataset is small enough, we provide the latent dataset for `selfie2anime`. So there is no need to create a latent dataset to test this repo. Simply unzip `latent_self2anime.zip`.
 
 ## Training a model
 
@@ -31,7 +32,7 @@ python img_train.py --data-dir="data\latent_selfie2anime"
 
 The most recent model will be saved in the logs directly under the directly with the start date. Images generated from the same noise will also be output every epoch, so you can observe the process!
 
-A pretrained model is to large to include in the project so you need to train your own! On a decent GPU the smaller model trained on selfie2anime should not take too long to train, perhaps a day before you see acceptable results.
+A pretrained model is to large to include in the project so you need to train your own! On a decent GPU the smaller model trained on selfie2anime should not take too long to train, perhaps a few hours before you see acceptable results, and longer training gives better and better results.
 
 ## Generating images with an existing model
 
