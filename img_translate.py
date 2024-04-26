@@ -57,7 +57,7 @@ image = image.to(device=device, dtype=torch.float32)
 image = center_crop_square(image)
 image = resize_square(image, TARGET_SIZE)
 image = (image / 127.5) - 1
-image = image.unsqueeze(0)  
+image = image.unsqueeze(0)
 
 #
 # Autoencoder
@@ -100,10 +100,10 @@ def save_sample(x, path):
 #
 
 model: MDTv2 = MDTv2(
-    depth=12, 
-    hidden_size=384, 
-    patch_size=2, 
-    num_heads=6, 
+    depth=12,
+    hidden_size=384,
+    patch_size=2,
+    num_heads=6,
     num_classes=2, 
     learn_sigma=True,
     class_dropout_prob=0.0)

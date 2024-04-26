@@ -77,10 +77,10 @@ def save_sample(x, path):
 #
 
 model: MDTv2 = MDTv2(
-    depth=12, 
-    hidden_size=384, 
-    patch_size=2, 
-    num_heads=6, 
+    depth=12,
+    hidden_size=384,
+    patch_size=2,
+    num_heads=6,
     num_classes=2, 
     learn_sigma=True,
     class_dropout_prob=0.0)
