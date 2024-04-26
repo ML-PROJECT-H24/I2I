@@ -1,3 +1,5 @@
+# Taken from MDTv2's official repo: https://github.com/sail-sg/MDT/blob/main/masked_diffusion/models.py
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,7 +10,6 @@ import math
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., num_patches=None):
